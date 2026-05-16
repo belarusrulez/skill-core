@@ -1,0 +1,482 @@
+#!/bin/sh
+# sc:search — context-less skill search via SQLite FTS5 + Reciprocal Rank Fusion.
+#
+# Subcommands:
+#   search <q1> [q2] [q3] ...   multi-axis RRF search (default if first arg looks like a query)
+#   reindex                     rebuild FTS5 index atomically
+#   list-roots                  print resolved skill roots from ~/.sc/repos.patterns
+#   doctor [--write-sample]     validate config; optionally seed a starter repos.patterns
+#
+# Bare `action q1 q2 q3` is equivalent to `action search q1 q2 q3`.
+# Exit codes: 0=hits, 1=no hits, 2=config error, 3=index error.
+
+set -eu
+
+SC_HOME="${SC_HOME:-$HOME/.sc}"
+SC_PATTERNS="$SC_HOME/repos.patterns"
+SC_SEARCH_DIR="$SC_HOME/search"
+SC_INDEX="$SC_SEARCH_DIR/index.db"
+SC_INDEX_TMP="$SC_SEARCH_DIR/index.db.tmp"
+SC_INDEX_HASH="$SC_SEARCH_DIR/.index_hash"
+SC_LAST_Q="$SC_SEARCH_DIR/.last_queries"
+
+# Resolve script dir → load shared helpers. We must follow symlinks so that
+# invocation via ~/.sc/search/action (a symlink to the real source) still finds
+# the sibling lib/ dir. BSD/POSIX-portable: chase readlink in a loop.
+sc_resolve() {
+  p="$1"
+  while [ -L "$p" ]; do
+    target=$(readlink "$p")
+    case "$target" in
+      /*) p="$target" ;;
+      *)  p="$(dirname "$p")/$target" ;;
+    esac
+  done
+  printf "%s\n" "$p"
+}
+SCRIPT_REAL=$(sc_resolve "$0")
+SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_REAL")" && pwd)
+SC_LIB="${SC_LIB:-$SCRIPT_DIR/../lib/discover.sh}"
+if [ ! -f "$SC_LIB" ]; then
+  printf 'ERROR: missing helper library: %s\n' "$SC_LIB" >&2
+  exit 2
+fi
+# shellcheck disable=SC1090
+. "$SC_LIB"
+
+# Local aliases for readability.
+warn()             { sc_warn "$@"; }
+err()              { sc_err "$@"; }
+sql_esc()          { sc_sql_esc "$@"; }
+expand_root()      { sc_expand_root "$@"; }
+parse_patterns()   { sc_parse_patterns "$@"; }
+discover_skills()  { sc_discover_skills "$@"; }
+fm_field()         { sc_fm_field "$@"; }
+body_after_fm()    { sc_body_after_fm "$@"; }
+
+# ----- reindex: rebuild FTS5 index atomically -----
+cmd_reindex() {
+  # Accept --full as a no-op for forward-compat (we always do a full rebuild).
+  for arg in "$@"; do
+    case "$arg" in
+      --full) : ;;
+      *) err "unknown reindex flag: $arg"; return 1 ;;
+    esac
+  done
+  mkdir -p "$SC_SEARCH_DIR"
+  rm -f "$SC_INDEX_TMP"
+
+  # Create schema in tmp DB
+  sqlite3 "$SC_INDEX_TMP" <<'SQL' || { err "failed to create index schema"; return 3; }
+CREATE VIRTUAL TABLE skills USING fts5(
+  name, dirname, path UNINDEXED,
+  description, content,
+  tokenize='unicode61'
+);
+SQL
+
+  # Materialize the skill-dir list to avoid a subshell pipe (so we can track count
+  # in the outer shell and propagate `return 3` on failure).
+  dirs_file=$(mktemp -t sc_dirs.XXXXXX)
+  discover_skills > "$dirs_file"
+
+  count=0
+  fail=0
+  while IFS= read -r d; do
+    [ -d "$d" ] || continue
+    smd="$d/SKILL.md"
+    [ -f "$smd" ] || continue
+    dirname_v=$(basename "$d")
+    name_v=$(fm_field name "$smd")
+    desc_v=$(fm_field description "$smd")
+    body_v=$(body_after_fm "$smd")
+
+    n_e=$(printf "%s"  "$name_v"     | sql_esc)
+    dn_e=$(printf "%s" "$dirname_v"  | sql_esc)
+    p_e=$(printf "%s"  "$d"          | sql_esc)
+    de_e=$(printf "%s" "$desc_v"     | sql_esc)
+    b_e=$(printf "%s"  "$body_v"     | sql_esc)
+
+    if ! sqlite3 "$SC_INDEX_TMP" "INSERT INTO skills(name,dirname,path,description,content) VALUES ('$n_e','$dn_e','$p_e','$de_e','$b_e');"; then
+      err "insert failed for $d"
+      fail=1
+      break
+    fi
+    count=$((count + 1))
+  done < "$dirs_file"
+  rm -f "$dirs_file"
+
+  if [ "$fail" -ne 0 ]; then
+    rm -f "$SC_INDEX_TMP"
+    return 3
+  fi
+
+  if [ "$count" -eq 0 ]; then
+    err "tmp index is empty (no skills discovered?)"
+    rm -f "$SC_INDEX_TMP"
+    return 3
+  fi
+
+  mv "$SC_INDEX_TMP" "$SC_INDEX" || { err "atomic mv failed"; return 3; }
+  # Persist the hash of the freshly-indexed skill set so future invocations can
+  # skip reindex when nothing changed. Compute against the same dirs we just
+  # walked so the stored hash matches reality.
+  new_hash=$(compute_skills_hash 2>/dev/null || true)
+  [ -n "$new_hash" ] && printf "%s\n" "$new_hash" > "$SC_INDEX_HASH"
+  printf "indexed %s skill(s) into %s\n" "$count" "$SC_INDEX"
+}
+
+# ----- compute_skills_hash: SHA-256 over <path>+<content> of every SKILL.md -----
+# Stable as long as the set of indexed skills and their contents don't change.
+# Uses discover_skills so the hash always matches what cmd_reindex would write.
+compute_skills_hash() {
+  dh_tmp=$(mktemp -t sc_hash.XXXXXX)
+  discover_skills 2>/dev/null > "$dh_tmp"
+  while IFS= read -r d; do
+    f="$d/SKILL.md"
+    if [ -f "$f" ]; then
+      printf "%s\n" "$f"
+      cat "$f"
+      printf "\n"
+    fi
+  done < "$dh_tmp" | shasum -a 256 | awk '{print $1}'
+  rm -f "$dh_tmp"
+}
+
+# ----- auto_reindex_if_changed: rebuild silently when skill set drifts -----
+# Cheap when nothing changed (~hash-only) — runs on every non-reindex invocation.
+# Best-effort: never returns non-zero. If the config is bad or nothing is
+# discoverable, we defer to the actual subcommand to surface that state.
+auto_reindex_if_changed() {
+  [ -f "$SC_PATTERNS" ] || return 0
+
+  # Nothing to index → skip; doctor (or another subcommand) will report it.
+  any=$(discover_skills 2>/dev/null | head -n 1 || true)
+  [ -n "$any" ] || return 0
+
+  cur=$(compute_skills_hash 2>/dev/null || true)
+  [ -n "$cur" ] || return 0
+
+  stored=""
+  [ -f "$SC_INDEX_HASH" ] && stored=$(cat "$SC_INDEX_HASH" 2>/dev/null || true)
+
+  if [ ! -f "$SC_INDEX" ] || [ "$cur" != "$stored" ]; then
+    cmd_reindex >&2 || return 0
+  fi
+  return 0
+}
+
+# ----- ensure_index: rebuild if missing (defensive fallback) -----
+ensure_index() {
+  if [ ! -f "$SC_INDEX" ]; then
+    cmd_reindex >&2 || return 3
+  fi
+}
+
+# ----- escape_fts_q: sanitize query for FTS5 MATCH -----
+# Tokens are OR'd within a query so partial matches still hit. Convergence
+# noise is suppressed downstream by capping each per-query result to top-K
+# (PER_QUERY_TOPK) before RRF merge — weak matches don't qualify as axis hits.
+escape_fts_q() {
+  printf "%s" "$1" | awk '
+    {
+      out = ""
+      for (i = 1; i <= NF; i++) {
+        t = $i
+        gsub(/"/, "", t)
+        if (t == "") continue
+        if (out != "") out = out " OR "
+        out = out "\"" t "\""
+      }
+      print out
+    }
+  '
+}
+
+# ----- cmd_search: multi-axis RRF search -----
+cmd_search() {
+  if [ "$#" -lt 1 ]; then
+    err "search requires at least one query string"
+    return 2
+  fi
+  if [ "$#" -lt 3 ]; then
+    warn "fewer than 3 queries supplied ($# given); recommended: pass literal + synonym + intent axes"
+  fi
+
+  limit=20
+  format=text
+  # Parse leading flags
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --limit)   limit="${2:?--limit needs value}"; shift 2 ;;
+      --limit=*) limit="${1#--limit=}"; shift ;;
+      --format)   format="${2:?--format needs value}"; shift 2 ;;
+      --format=*) format="${1#--format=}"; shift ;;
+      --) shift; break ;;
+      -*) err "unknown flag: $1"; return 2 ;;
+      *) break ;;
+    esac
+  done
+  case "$format" in text|tsv|json) ;; *) err "unknown format: $format"; return 2 ;; esac
+
+  if [ "$#" -lt 1 ]; then
+    err "search requires at least one query string"
+    return 2
+  fi
+
+  ensure_index || return 3
+
+  # Stash queries for debugging
+  mkdir -p "$SC_SEARCH_DIR"
+  : > "$SC_LAST_Q"
+  i=0
+  for q in "$@"; do
+    i=$((i + 1))
+    printf "%s\n" "$q" >> "$SC_LAST_Q"
+  done
+
+  # Build a temp SQL script. For each query: insert (path, rnk) rows into the temp
+  # ranks table. Then final RRF aggregation query.
+  sql_file="$(mktemp -t sc_search.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -f \"$sql_file\"" EXIT INT TERM
+
+  {
+    printf "CREATE TEMP TABLE ranks(path TEXT, rnk INTEGER);\n"
+    for q in "$@"; do
+      fq=$(escape_fts_q "$q")
+      [ -z "$fq" ] && continue
+      fq_e=$(printf "%s" "$fq" | sql_esc)
+      # Cap each per-query result to top-K=5 so weak matches don't qualify
+      # as axis hits (tuned for ~30-100 skill corpora).
+      printf "INSERT INTO ranks(path, rnk)\n"
+      printf "SELECT path, rnk FROM (\n"
+      printf "  SELECT path, ROW_NUMBER() OVER (ORDER BY bm25(skills, 10, 8, 5, 4)) AS rnk\n"
+      printf "  FROM skills WHERE skills MATCH '%s'\n" "$fq_e"
+      printf ") WHERE rnk <= 5;\n"
+    done
+    printf ".mode tabs\n"
+    printf "SELECT r.path,\n"
+    printf "       (SELECT name        FROM skills s WHERE s.path = r.path) AS name,\n"
+    printf "       (SELECT dirname     FROM skills s WHERE s.path = r.path) AS dirname,\n"
+    printf "       (SELECT description FROM skills s WHERE s.path = r.path) AS description,\n"
+    printf "       SUM(1.0 / (10.0 + r.rnk)) AS score,\n"
+    printf "       COUNT(*) AS axes\n"
+    printf "FROM ranks r\n"
+    printf "GROUP BY r.path\n"
+    printf "ORDER BY score DESC, axes DESC, name ASC\n"
+    printf "LIMIT %s;\n" "$limit"
+  } > "$sql_file"
+
+  results=$(sqlite3 "$SC_INDEX" < "$sql_file" 2>/dev/null) || {
+    err "sqlite query failed"
+    rm -f "$sql_file"
+    return 3
+  }
+  rm -f "$sql_file"
+  trap - EXIT INT TERM
+
+  if [ -z "$results" ]; then
+    case "$format" in
+      json) printf '{"results":[]}\n' ;;
+      tsv)  : ;;
+      text) printf "no skills matched.\n" ;;
+    esac
+    return 1
+  fi
+
+  case "$format" in
+    tsv)
+      # Columns: path\tname\tdirname\tdescription\tscore\taxes
+      printf "%s\n" "$results"
+      ;;
+    json)
+      # Hand-rolled JSON (no jq). One object per row.
+      printf '{"results":['
+      first=1
+      printf "%s\n" "$results" | while IFS=$(printf '\t') read path name dirname description score axes; do
+        [ -n "$path" ] || continue
+        je() { printf "%s" "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+        if [ "$first" -eq 1 ]; then first=0; else printf ","; fi
+        printf '{"path":"%s","name":"%s","dirname":"%s","description":"%s","score":%s,"axes":%s}' \
+          "$(je "$path")" "$(je "$name")" "$(je "$dirname")" "$(je "$description")" \
+          "$score" "$axes"
+      done
+      printf ']}\n'
+      ;;
+    text)
+      # Split into convergence (axes >= 2) vs single-axis.
+      conv=$(printf "%s\n" "$results" | awk -F'\t' '$6 >= 2')
+      single=$(printf "%s\n" "$results" | awk -F'\t' '$6 < 2')
+
+      printf "## Convergence (matched 2+ axes — strongest signal)\n"
+      if [ -z "$conv" ]; then
+        printf "  (none)\n"
+      else
+        printf "%s\n" "$conv" | awk -F'\t' '{
+          desc = $4
+          if (length(desc) > 70) desc = substr(desc, 1, 67) "..."
+          printf "  %-22s axes=%s score=%.4f  %s\n           → %s\n", $2, $6, $5, desc, $1
+        }'
+      fi
+
+      printf "\n## Single-axis hits\n"
+      if [ -z "$single" ]; then
+        printf "  (none)\n"
+      else
+        printf "%s\n" "$single" | awk -F'\t' '{
+          desc = $4
+          if (length(desc) > 70) desc = substr(desc, 1, 67) "..."
+          printf "  %-22s axes=%s score=%.4f  %s\n           → %s\n", $2, $6, $5, desc, $1
+        }'
+      fi
+      printf "\n(→ shows the full path to SKILL.md — open it directly to use the skill)\n"
+      ;;
+  esac
+  return 0
+}
+
+# ----- cmd_list_roots -----
+cmd_list_roots() {
+  if [ ! -f "$SC_PATTERNS" ]; then
+    err "no $SC_PATTERNS — run: action doctor --write-sample"
+    return 2
+  fi
+  parse_patterns | awk -F'\t' '{ print $1 }' | sort -u | while read r; do
+    expand_root "$r"
+  done
+}
+
+# ----- cmd_doctor -----
+cmd_doctor() {
+  write_sample=0
+  for arg in "$@"; do
+    case "$arg" in
+      --write-sample) write_sample=1 ;;
+      *) err "unknown doctor flag: $arg"; return 2 ;;
+    esac
+  done
+
+  mkdir -p "$SC_HOME" "$SC_SEARCH_DIR"
+
+  if [ "$write_sample" -eq 1 ]; then
+    if [ -f "$SC_PATTERNS" ]; then
+      printf "exists: %s (not overwriting)\n" "$SC_PATTERNS"
+    else
+      cat > "$SC_PATTERNS" <<'EOF'
+# ~/.sc/repos.patterns — skill discovery sources.
+#
+# One entry per line. Format:
+#   <abs-root><TAB or whitespace><pattern>
+#
+# Pattern matches the skill directory's BASENAME.
+# Default = glob (e.g. "*"). Prefix with "re:" for an extended regex.
+# Lines starting with '#' are ignored. Blank lines ignored.
+#
+# Examples:
+#   /Users/me/Projects/my-skills	*
+#   /Users/me/Projects/skill-core/sc	*
+#   /Users/me/Projects/other-repo/skills	re:^(foo|bar)-.*$
+#
+/Users/me/Projects/my-skills	*
+/Users/me/Projects/skill-core/sc	*
+EOF
+      printf "wrote sample: %s\n" "$SC_PATTERNS"
+    fi
+  fi
+
+  rc=0
+  if [ ! -f "$SC_PATTERNS" ]; then
+    err "missing $SC_PATTERNS"
+    err "run: action doctor --write-sample"
+    return 2
+  fi
+
+  printf "checking %s ...\n" "$SC_PATTERNS"
+  # Dedup roots and check existence. Materialize parse_patterns output to a
+  # tmpfile so the `while read` loop runs in THIS shell (not a subshell from a
+  # pipe) — otherwise `rc=2` assignments are scoped to the subshell and lost.
+  seen=$(mktemp -t sc_seen.XXXXXX)
+  pat_lines=$(mktemp -t sc_pats.XXXXXX)
+  : > "$seen"
+  parse_patterns > "$pat_lines"
+  while IFS=$(printf '\t') read -r root pat; do
+    root_e=$(expand_root "$root")
+    if grep -Fxq -- "$root_e" "$seen" 2>/dev/null; then
+      printf "  WARN duplicate root: %s\n" "$root_e" >&2
+    else
+      printf "%s\n" "$root_e" >> "$seen"
+    fi
+    if [ ! -d "$root_e" ]; then
+      printf "  WARN root does not exist: %s\n" "$root_e" >&2
+    else
+      printf "  OK   %s  pattern=%s\n" "$root_e" "$pat"
+    fi
+    case "$pat" in
+      re:.\**) printf "  WARN heavy regex (starts with .*) may be slow: %s\n" "$pat" >&2 ;;
+    esac
+  done < "$pat_lines"
+  rm -f "$seen" "$pat_lines"
+
+  printf "\nindex: %s\n" "$SC_INDEX"
+  if [ -f "$SC_INDEX" ]; then
+    cnt=$(sqlite3 "$SC_INDEX" 'SELECT COUNT(*) FROM skills;' 2>/dev/null || echo "?")
+    printf "  %s skill(s) indexed\n" "$cnt"
+  else
+    printf "  (not built — run: action reindex)\n"
+  fi
+  return "$rc"
+}
+
+# ----- usage -----
+usage() {
+  cat <<'EOF'
+usage: action <subcommand> [args]
+       action <q1> [q2] [q3]      # shorthand for `action search ...`
+
+  search [--limit N] [--format text|tsv|json] <q1> [q2] [q3] ...
+                              multi-axis RRF search; >=3 queries recommended
+  reindex                     rebuild FTS5 index atomically
+  list-roots                  print resolved roots from ~/.sc/repos.patterns
+  doctor [--write-sample]     validate config; --write-sample seeds a starter
+
+exit: 0=hits, 1=no hits, 2=config, 3=index
+EOF
+}
+
+# ----- dispatch -----
+main() {
+  if [ "$#" -eq 0 ]; then
+    usage
+    return 2
+  fi
+
+  # Auto-reindex when the indexed skill set changed. Skipped for help (no work
+  # needed) and reindex (about to rebuild anyway). Best-effort — failures are
+  # non-fatal so the subcommand can still surface a real diagnostic.
+  case "$1" in
+    -h|--help|help|reindex) ;;
+    *) auto_reindex_if_changed ;;
+  esac
+
+  case "$1" in
+    -h|--help|help)
+      usage; return 0 ;;
+    search)
+      shift; cmd_search "$@" ;;
+    reindex)
+      shift; cmd_reindex "$@" ;;
+    list-roots|list_roots|roots)
+      shift; cmd_list_roots "$@" ;;
+    doctor)
+      shift; cmd_doctor "$@" ;;
+    --*)
+      # bare flags belong to search
+      cmd_search "$@" ;;
+    *)
+      # Bare positional → treat as search query
+      cmd_search "$@" ;;
+  esac
+}
+
+main "$@"
