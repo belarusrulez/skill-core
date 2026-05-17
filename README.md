@@ -6,10 +6,11 @@
 
 ## TL;DR
 
-You have skills / prompts / extensions scattered across folders. Half of them you didn't write, half you don't remember, none are searchable. skill-core registers exactly **two** skills with your agent and lets every other skill stay wherever you keep it — a git repo, a notes folder, anywhere on disk:
+You have skills / prompts / extensions scattered across folders. Half of them you didn't write, half you don't remember, none are searchable. skill-core registers exactly **three** skills with your agent and lets every other skill stay wherever you keep it — a git repo, a notes folder, anywhere on disk:
 
 - **`sc:search`** — a multi-axis search that finds the right `SKILL.md` for what the user is trying to do, across every repo you've pointed it at.
 - **`sc:crud`** — a procedural skill for creating, updating, deleting, and importing other skills.
+- **`sc:list`** — a flat inventory of every registered skill (the catalog view; `sc:search` is the ranked view).
 
 `sc:search` returns the **full path** to the matching `SKILL.md`. The agent reads that file and follows it. No agent-side registration, no slash-command sprawl, no shadow registry — your skills are just files on disk.
 
@@ -17,7 +18,7 @@ You have skills / prompts / extensions scattered across folders. Half of them yo
 
 If you use more than one LLM coding tool, you've probably watched your agents' "skills" / "extensions" / "prompts" lists turn into a graveyard. Each tool wants its own registration layer, each one nags you for a fresh round of YAML, and over time you end up with dozens of half-working snippets cluttering whatever directory your agent reads from. Most of them you didn't write, most of them you don't remember, none of them are searchable.
 
-skill-core throws that out. Two skills register with the agent. Everything else stays on disk and gets discovered by full-path lookup at the moment of need.
+skill-core throws that out. Three skills register with the agent. Everything else stays on disk and gets discovered by full-path lookup at the moment of need.
 
 The search is intentionally simple: pass three queries (literal phrase, synonym/jargon, intent/goal), it merges them with Reciprocal Rank Fusion, and surfaces skills that match across multiple axes. The vocabulary mismatch between "how the user phrased it" and "how the skill author phrased it" is the main failure mode in agent skill discovery; three axes hedges against it cheaply.
 
@@ -25,7 +26,7 @@ The search is intentionally simple: pass three queries (literal phrase, synonym/
 
 Paste this into a fresh agent session:
 
-> Bootstrap skill-core on this machine: ask the user where to clone `git@github.com:belarusrulez/skill-core.git` (suggest the directory where the LLM started as the default), then execute the steps under "Bootstrap on a fresh machine" in INSTALL.md in order. In steps 5 and 6 you register the two bootstrap skills with your harness — use whatever mechanism your harness expects for installing a skill from a SKILL.md file; you know how. In step 9 you install the task-intake global rule into the harness's global rules file. After step 8, confirm `sc:search` and `sc:crud` are registered; after step 9, confirm the task-intake rule is in place. Do not commit anything.
+> Bootstrap skill-core on this machine: ask the user where to clone `git@github.com:belarusrulez/skill-core.git` (suggest the directory where the LLM started as the default), then execute the steps under "Bootstrap on a fresh machine" in INSTALL.md in order. In step 5 you register the three bootstrap skills (`sc:search`, `sc:crud`, `sc:list`) with your harness — use whatever mechanism your harness expects for installing a skill from a SKILL.md file; you know how, and register all three the same way. In step 8 you install the task-intake global rule into the harness's global rules file. After step 7, confirm `sc:search`, `sc:crud`, and `sc:list` are registered; after step 8, confirm the task-intake rule is in place. Do not commit anything.
 
 See [INSTALL.md](INSTALL.md) for the annotated walkthrough with rationale, the full layout diagram, and notes on each step.
 
@@ -33,7 +34,7 @@ See [INSTALL.md](INSTALL.md) for the annotated walkthrough with rationale, the f
 
 Paste this into an agent session:
 
-> Uninstall skill-core on this machine: unregister `sc:search` and `sc:crud` from your harness — use whatever mechanism your harness expects to remove a skill from a SKILL.md registration; you know how. Then remove the runtime tree: `rm -rf ~/.sc/`. The cloned source repo is left alone — ask me whether to delete it too before doing so. Source repos listed in `~/.sc/repos.patterns` are not touched at any point; only the runtime state and the two harness entries go away.
+> Uninstall skill-core on this machine: unregister `sc:search`, `sc:crud`, and `sc:list` from your harness — use whatever mechanism your harness expects to remove a skill from a SKILL.md registration; you know how, and remove all three. Then remove the runtime tree: `rm -rf ~/.sc/`. The cloned source repo is left alone — ask me whether to delete it too before doing so. Source repos listed in `~/.sc/repos.patterns` are not touched at any point; only the runtime state and the three harness entries go away.
 
 ## Day-to-day usage
 
@@ -44,6 +45,13 @@ sh ~/.sc/search/action "<literal phrase>" "<synonym/jargon>" "<intent/goal>"
 ```
 
 Results include a `→ <full path>` line under each hit. Read the `SKILL.md` at that path and follow its instructions.
+
+For the full inventory (no ranking, no query — just everything), invoke `sc:list`:
+
+```sh
+sh ~/.sc/list/action                # text inventory grouped by root
+sh ~/.sc/list/action --format json  # machine-readable
+```
 
 To add, edit, delete, or import skills, use `sc:crud` (see `sc/crud/SKILL.md`).
 
@@ -58,10 +66,13 @@ To add, edit, delete, or import skills, use `sc:crud` (see `sc/crud/SKILL.md`).
 
 | Path | What |
 |---|---|
-| `sc/search/action` | The only shell CLI — search, reindex, list-roots, doctor |
+| `sc/search/action` | `sc:search` CLI — search, reindex, list-roots, doctor |
 | `sc/search/SKILL.md` | `sc:search` skill doc (loaded by the agent) |
-| `sc/crud/SKILL.md` | `sc:crud` procedural skill doc (no CLI) |
-| `sc/lib/discover.sh` | Shared shell helpers |
+| `sc/crud/action` | `sc:crud` CLI — collision-check, scaffold, validate, trash, restore, import-preview |
+| `sc/crud/SKILL.md` | `sc:crud` procedural skill doc (delegates deterministic steps to `sc/crud/action`) |
+| `sc/list/action` | `sc:list` CLI — flat catalog of every registered skill |
+| `sc/list/SKILL.md` | `sc:list` skill doc (loaded by the agent) |
+| `sc/lib/discover.sh` | Shared shell helpers (used by all three CLIs) |
 | `test/run-tests.sh` | Test harness |
 | `INSTALL.md` | Detailed bootstrap walkthrough |
 | `docs/architecture.mmd` | Architecture diagram |

@@ -1,23 +1,27 @@
 flowchart TB
   U["User: 'find a skill for X' or 'make/update/delete a skill'"]
 
-  subgraph agent_h["Agent harness — skill-core adds these 2 (others may already be registered)"]
+  subgraph agent_h["Agent harness — skill-core adds these 3 (others may already be registered)"]
     A((Agent))
     R1["sc:search registration → SKILL.md"]
     R2["sc:crud registration → SKILL.md<br/><i>procedural — no CLI</i>"]
+    R3["sc:list registration → SKILL.md"]
   end
 
   subgraph runtime["~/.sc/ runtime"]
     P["repos.patterns"]
     DR["default_repo<br/><i>optional</i>"]
     IDX[("FTS5 index<br/>~/.sc/search/index.db")]
-    SACT["sh search/action<br/><i>only CLI in system</i>"]
+    SACT["sh search/action<br/><i>FTS5 + RRF ranked search</i>"]
+    CACT["sh crud/action<br/><i>scaffold/validate/trash/restore/import-preview</i>"]
+    LACT["sh list/action<br/><i>flat inventory (no index)</i>"]
     TR["trash/&lt;ts&gt;-&lt;name&gt;/<br/><i>soft-deleted skills</i>"]
   end
 
   subgraph sources["Source repos (any number, listed in repos.patterns)"]
     S4["skill-core/sc/search/SKILL.md"]
     S5["skill-core/sc/crud/SKILL.md"]
+    S6["skill-core/sc/list/SKILL.md"]
     S1["…/s-team/SKILL.md"]
     S2["…/s-commit/SKILL.md"]
     S3["other-repo/.../my-skill/SKILL.md"]
@@ -26,27 +30,39 @@ flowchart TB
   U --> A
   R1 -. "symlink (bootstrap)" .-> S4
   R2 -. "symlink (bootstrap)" .-> S5
+  R3 -. "symlink (bootstrap)" .-> S6
 
-  %% sc:search flow — find a skill
+  %% sc:search flow — find a skill (ranked)
   A -- "sc:search q1 q2 q3" --> SACT
   P -. "consumed by reindex" .-> SACT
   SACT <-->|"FTS5 + RRF (k=10, top-5)"| IDX
-  IDX -. "indexes" .-> S1 & S2 & S3 & S4 & S5
+  IDX -. "indexes" .-> S1 & S2 & S3 & S4 & S5 & S6
   SACT -- "results with → full path" --> A
+
+  %% sc:list flow — flat inventory
+  A -- "sc:list [--format|--match|--root]" --> LACT
+  P -. "walked each call" .-> LACT
+  LACT -. "walks SKILL.md under each root" .-> S1 & S2 & S3 & S4 & S5 & S6
+  LACT -- "rows: name, dirname, desc, path, root" --> A
+
   A -- "Read &lt;path&gt;/SKILL.md → follow" --> RUN["execute the skill"]
 
-  %% sc:crud flow — lifecycle (procedural)
+  %% sc:crud flow — lifecycle (procedural, delegates determinism to CACT)
   A == "sc:crud procedure" ==> DEC{{"named a skill?"}}
   DEC -- "yes" --> EDIT["Read + Edit existing<br/>SKILL.md directly"]
   DEC -- "no" --> CAND["call sc:search internally<br/>for 3-axis candidate search"]
   CAND --> ASK{{"present candidates<br/>vs create new?"}}
   ASK -- "update one" --> EDIT
-  ASK -- "create new" --> NEW["Write new dir +<br/>SKILL.md in target repo"]
-  ASK -- "delete" --> DEL["mv to trash/ +<br/>write .sc-trash-meta.json"]
-  EDIT --> RIDX[/"reindex --full"/]
-  NEW --> RIDX
+  ASK -- "create new" --> COL["crud/action collision-check"]
+  COL --> NEW["crud/action scaffold<br/><i>write SKILL.md + action stub</i>"]
+  ASK -- "delete" --> DEL["crud/action trash<br/><i>mv + write meta JSON</i>"]
+  EDIT --> VAL[/"crud/action validate<br/><i>integrity check, mandatory</i>"/]
+  NEW --> VAL
+  VAL --> RIDX[/"reindex --full"/]
   DEL --> TR
   DEL --> RIDX
   RIDX --> SACT
+  COL -. "consults" .-> sources
   NEW -.-> sources
   EDIT -.-> sources
+  CACT -. "is" .-> COL & NEW & DEL & VAL

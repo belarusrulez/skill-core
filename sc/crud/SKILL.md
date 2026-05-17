@@ -1,12 +1,36 @@
 ---
 name: sc:crud
-description: Create, update, or import a skill. Use when the user says "make a new skill", "add a skill for X", "update the X skill", "edit the Y skill", "remove this skill", "import these skills", "register this folder of skills", "figure out what skills are in <dir> and register them", or describes a workflow they want captured as a skill. The procedure first searches for existing skills that might already cover the user's intent (so we update rather than duplicate), then presents the candidates or — if the user named a specific skill — goes straight to it. Soft-delete via mv to ~/.sc/trash/, name-derivation rule: first '-' becomes ':' (e.g. my-cool-tool → my:cool-tool).
+description: Create, update, or import a skill. Use when the user says "make a new skill", "add a skill for X", "update the X skill", "edit the Y skill", "remove this skill", "import these skills", "register this folder of skills", "figure out what skills are in <dir> and register them", or describes a workflow they want captured as a skill. The procedure first searches for existing skills that might already cover the user's intent (so we update rather than duplicate), then presents the candidates or — if the user named a specific skill — goes straight to it. Soft-delete via mv to ~/.sc/trash/, name-derivation rule: first '-' becomes ':' (e.g. my-cool-tool → my:cool-tool). After any create or update, the procedure runs an integrity check (frontmatter present, name/description non-empty, helper scripts executable).
 user_invocable: true
+disable-model-invocation: true
 ---
 
-# sc:crud — lifecycle for skills (procedural, no CLI)
+# sc:crud — lifecycle for skills
 
-This skill is **a procedure**, not a shell command. You (the agent) execute the steps below using `Read`, `Edit`, `Write`, `Bash`. There is no `sc/crud/action` script — the procedure runs entirely in-agent.
+`sc:crud` is a **mixed procedure**:
+
+- You (the agent) own the *judgment* steps — deciding update-vs-create, choosing the target repo, writing the description prose, recognizing when a candidate from `sc:search` is the right update target.
+- The deterministic filesystem operations are delegated to **`sh ~/.sc/crud/action <subcommand>`**, so the result is identical every time and costs zero LLM tokens.
+
+```sh
+sh ~/.sc/crud/action help
+# collision-check <dirname>     exit 0=ok, 1=collision (prints colliding paths)
+# scaffold <target-dir>         write SKILL.md + executable action stub
+# validate <skill-dir>          check structure; exit 0=ok, 1=issues
+# trash <source-dir>            soft-delete to ~/.sc/trash/; prints trash path
+# restore <trash-entry>         move back to orig_path from meta JSON
+# import-preview <root>         emit TSV: path<TAB>name<TAB>description<TAB>issues
+```
+
+## Integrity rule — ALWAYS validate after create or update
+
+After **every** Step 4 (Update) and Step 5 (Create), and after a Step 7 (Import) of any skill you just touched, run:
+
+```sh
+sh ~/.sc/crud/action validate <skill-dir>
+```
+
+It checks: SKILL.md exists, has a frontmatter block, `name` and `description` fields are non-empty, and any `action` / `*.sh` files are executable. If validate exits non-zero, fix the issues it reports **before** confirming the create/update to the user. A skill that fails validate is broken for downstream consumers (`sc:search` indexing, `sc:list` enumeration, agents reading the SKILL.md).
 
 ## Triggers
 
@@ -35,7 +59,7 @@ If Convergence is empty AND no Single-axis hit scores above ~0.10, skip to Step 
 
 ### Step 3 — Present candidates to the user (or skip to create)
 
-If Step 2 surfaced candidates, present them to the user as a short numbered list and ask:
+If Step 2 surfaced candidates, present them as a short numbered list and ask:
 
 > I found existing skills that look related:
 >
@@ -45,9 +69,9 @@ If Step 2 surfaced candidates, present them to the user as a short numbered list
 >
 > Update one of these, or create a new skill?
 
-Wait for the user's answer. If they pick (N) → go to Step 4 (Update) with that skill. If they say "new" / "create new" / "none of these" → go to Step 5 (Create).
+Wait for the user's answer. If they pick (N) → Step 4 (Update). If they say "new" / "create new" / "none of these" → Step 5 (Create).
 
-If Step 2 found nothing worth proposing, **don't bother asking** — just confirm the create intent in one sentence and go to Step 5.
+If Step 2 found nothing worth proposing, **don't bother asking** — confirm the create intent in one sentence and go to Step 5.
 
 ### Step 4 — Update an existing skill
 
@@ -55,8 +79,13 @@ If Step 2 found nothing worth proposing, **don't bother asking** — just confir
 2. Discuss the change with the user if needed. Otherwise apply directly.
 3. Use `Edit` to make targeted changes. Preserve the existing frontmatter `name:` exactly — never rename via update; the user must rename the directory if they want a different `name:` (see "Rename" below).
 4. If the change affects the `description:` field, front-load it with trigger phrases users would type when looking for the skill.
-5. Run `sh ~/.sc/search/action reindex --full` to refresh the FTS5 index.
-6. Confirm to the user: "Updated `<name>` at `<path>`."
+5. **Validate** (mandatory):
+   ```sh
+   sh ~/.sc/crud/action validate <skill-dir>
+   ```
+   If non-zero, fix the reported issues and re-run.
+6. Run `sh ~/.sc/search/action reindex --full` to refresh the FTS5 index.
+7. Confirm to the user: "Updated `<name>` at `<path>`."
 
 ### Step 5 — Create a new skill
 
@@ -68,85 +97,66 @@ If Step 2 found nothing worth proposing, **don't bother asking** — just confir
 
 2. **Pick a directory name.** Conventionally kebab-case with a clear namespace prefix (e.g. `git-bisect`, `aws-s3-sync`). The first `-` becomes the `:` in the frontmatter name (see "Name derivation" below).
 
-3. **Collision check.** Discover skills via:
+3. **Collision check:**
    ```sh
-   sh ~/.sc/search/action list-roots
+   sh ~/.sc/crud/action collision-check <dirname>
    ```
-   then for each root, `find <root> -name SKILL.md` and check no directory has the chosen basename anywhere. If a collision is found, propose a renamed variant and ask the user.
+   Exits 0 if the basename is free, 1 if a skill with that basename already exists (printed paths go to stderr). On collision, propose a renamed variant and ask the user.
 
-4. **Scaffold.** Compute `<target> = <resolved-repo-skills-dir>/<dirname>`. (For repos with a `skills/` layout, this is `<repo>/skills/<dirname>`.) `Write` the following two files:
-
-   `<target>/SKILL.md`:
-   ```markdown
-   ---
-   name: <derived-name>
-   description: <one trigger-style sentence — what the skill does + WHEN to use it. Front-load synonyms.>
-   user_invocable: true
-   ---
-
-   # <derived-name>
-
-   <body — describe the procedure. Include concrete CLI examples, use WHEN / do NOT use WHEN guidance, related skills.>
-   ```
-
-   `<target>/skill.sh` (optional, only if the skill needs a helper):
+4. **Scaffold:**
    ```sh
-   #!/bin/sh
-   set -eu
-   # TODO — implement the skill's helper logic, or delete this file.
-   echo "$(basename "$0"): TODO implement"
+   sh ~/.sc/crud/action scaffold <target-dir>
    ```
-   `chmod +x <target>/skill.sh` if you wrote it.
+   Writes a `SKILL.md` template (with the derived name pre-filled) and an executable `action` stub. Edit both to replace TODOs:
+   - Replace the frontmatter `description:` with one trigger-style sentence; front-load the synonyms users will type.
+   - Replace the body with the actual procedure.
+   - If the skill is procedural-only and needs no helper, delete the `action` stub.
 
-5. **Reindex:**
+5. **Validate** (mandatory):
+   ```sh
+   sh ~/.sc/crud/action validate <target-dir>
+   ```
+   If non-zero, fix the reported issues and re-run.
+
+6. **Reindex:**
    ```sh
    sh ~/.sc/search/action reindex --full
    ```
 
-6. **Confirm to the user:** "Created `<name>` at `<target>`."
+7. **Confirm to the user:** "Created `<name>` at `<target>`."
 
 ### Step 6 — Delete a skill (when user asks)
 
 Soft-delete by default. Hard-delete only if user explicitly says "purge", "permanently delete", or "rm -rf".
 
-Soft-delete procedure:
+```sh
+sh ~/.sc/crud/action trash <source-dir>
+# prints: /Users/.../.sc/trash/<ISO-ts>-<dirname>
+```
 
-1. Find the skill source dir (use `sc:search` to look it up, or `find` if user gave an exact dirname).
-2. Build a timestamp: `ts=$(date -u +%Y-%m-%dT%H-%M-%SZ)`.
-3. `mkdir -p ~/.sc/trash/${ts}-<dirname>`.
-4. `mv <source-dir> ~/.sc/trash/${ts}-<dirname>` (the trash dir takes over the source dir path).
+The action handles timestamping, the `mv`, and the `.sc-trash-meta.json` atomically. Then:
 
-   Actually simpler — just rename the source into trash:
-   ```sh
-   ts=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-   mv "<source-dir>" "$HOME/.sc/trash/${ts}-<dirname>"
-   ```
-5. `Write` `~/.sc/trash/${ts}-<dirname>/.sc-trash-meta.json` with the original path so restore is possible:
-   ```json
-   {
-     "name": "<dirname>",
-     "orig_path": "<source-dir>",
-     "deleted_at": "<ISO-8601 Z>"
-   }
-   ```
-6. Reindex.
-7. Confirm: "Soft-deleted `<name>`. Restore with: `mv ~/.sc/trash/${ts}-<dirname> <orig_path>` (or read the meta JSON)."
+```sh
+sh ~/.sc/search/action reindex --full
+```
+
+Confirm: "Soft-deleted `<name>`. Restore with: `sh ~/.sc/crud/action restore <trash-path>`."
 
 Hard-delete (`--purge` / "permanently") skips the trash:
 ```sh
 rm -rf "<source-dir>"
+sh ~/.sc/search/action reindex --full
 ```
-Reindex. Confirm.
 
 ### Step 7 — Import / register existing skills
 
 Use when the user points at a directory that already contains one or more `SKILL.md` files but isn't yet discoverable by `sc:search`. Trigger phrases: "import these skills", "register this folder", "add this skills repo", "figure out what skills are in `<dir>` and register them".
 
-> **Terminology note:** "Register" here means register the *source root* with `sc:search`'s discovery config (`~/.sc/repos.patterns`) and refresh the FTS5 index. It does NOT install the skill into the agent harness — `sc:search` and `sc:crud` are the bootstrap harness entries skill-core itself adds; everything else stays path-based and is consumed by reading the SKILL.md at its full path.
+> **Terminology note:** "Register" here means register the *source root* with `sc:search`'s discovery config (`~/.sc/repos.patterns`) and refresh the FTS5 index. It does NOT install the skill into the agent harness — `sc:search`, `sc:crud`, and `sc:list` are the bootstrap harness entries skill-core itself adds; everything else stays path-based and is consumed by reading the SKILL.md at its full path.
 
 1. **Resolve the source root.** Use the absolute path the user supplied. If they pointed at a single skill dir (one containing `SKILL.md`), use its parent as the root.
 
-2. **Check whether the root is already covered.** Read `~/.sc/repos.patterns`. If any existing `<abs-root>` line equals the target root — or is an ancestor of it (the target lives inside an already-listed root) — the root is already registered. Skip to step 5.
+2. **Check whether the root is already covered.** Read `~/.sc/repos.patterns`. If any existing `<abs-root>` line equals the target root — or is an ancestor of it — the root is already registered. Skip to step 5.
 
 3. **Append the root.** Add a single line to `~/.sc/repos.patterns`:
    ```
@@ -160,11 +170,11 @@ Use when the user points at a directory that already contains one or more `SKILL
    ```
    Fix any errors surfaced before continuing.
 
-5. **Discover what's under the root** (so the confirmation in step 7 is accurate):
+5. **Preview what's under the root:**
    ```sh
-   find "<abs-root>" -name SKILL.md
+   sh ~/.sc/crud/action import-preview <abs-root>
    ```
-   For each result, read the first ~6 lines to confirm valid frontmatter (`name:`, `description:`). Note any SKILL.md missing required fields — surface those to the user so they can fix.
+   Emits TSV: `path<TAB>name<TAB>description<TAB>issues` per discovered SKILL.md. The `issues` column flags `missing-name`, `missing-description`, or `no-frontmatter` so you can surface broken skills to the user before they're indexed.
 
 6. **Reindex:**
    ```sh
@@ -178,25 +188,22 @@ Use when the user points at a directory that already contains one or more `SKILL
 
 ### Rename
 
-A rename = move the directory + update the frontmatter `name:`:
+A rename = move the directory + update the frontmatter `name:` + validate:
 
 ```sh
 mv "<source>/<old-dirname>" "<source>/<new-dirname>"
 ```
-Then `Edit` `<source>/<new-dirname>/SKILL.md` to update the `name:` field (apply the derivation rule below).
-Reindex.
+Then `Edit` `<source>/<new-dirname>/SKILL.md` to update the `name:` field (apply the derivation rule below), run `validate`, then reindex.
 
 ### Restore from trash
 
 ```sh
 ls ~/.sc/trash/
+sh ~/.sc/crud/action restore ~/.sc/trash/<entry>
+sh ~/.sc/search/action reindex --full
 ```
-Find the entry. Read `.sc-trash-meta.json` (via awk if needed) to recover `orig_path`. Then:
-```sh
-mv "~/.sc/trash/<entry>" "<orig_path>"
-rm -f "<orig_path>/.sc-trash-meta.json"
-```
-Reindex.
+
+The action reads `.sc-trash-meta.json`, moves the dir back to `orig_path`, and removes the meta file.
 
 ## Name derivation (canonical)
 
@@ -212,7 +219,7 @@ The frontmatter `name:` is the directory basename with **only the first `-` repl
 | `alpha-beta-gamma` | `alpha:beta-gamma`                    |
 | `noskill`          | `noskill` (no dash → unchanged)       |
 
-This is **different from the old `s:create`**, which converted every `-`. If the user is migrating an old skill, ask them whether they want `every-dash:as-colon` (old) or `first-only:as-colon` (current convention) — the current convention is recommended.
+Note: this convention covers the **flat** layout (`<repo>/skills/<dirname>/SKILL.md`). Some repos use a **nested** namespace layout (e.g. skill-core puts `sc:list` at `sc/list/` rather than `sc/sc-list/`); in that case the author picks `name:` directly and `validate` doesn't second-guess it.
 
 ## Always after a mutation
 
@@ -229,7 +236,8 @@ to catch malformed config before reindexing.
 - `~/.sc/repos.patterns` — one `<abs-root><TAB><pattern>` per line. Pattern is a glob over directory basenames; `re:` prefix for regex.
 - `~/.sc/default_repo` — single-line file with the abs path used when the user doesn't specify a repo on create.
 - `~/.sc/trash/<ISO-Z-ts>-<dirname>/` — soft-deleted skills with `.sc-trash-meta.json`.
-- Skills you create with this procedure are **not** registered with the agent harness — they live in a source repo and are discovered by `sc:search`. The only harness entries skill-core adds are `sc:search` and `sc:crud` themselves; anything else already in the harness is left alone.
+- `~/.sc/crud/action` — the CLI this skill delegates deterministic work to. Symlinked from `<repo>/sc/crud/action`.
+- Skills you create with this procedure are **not** registered with the agent harness — they live in a source repo and are discovered by `sc:search` and `sc:list`. The only harness entries skill-core adds are `sc:search`, `sc:crud`, and `sc:list` themselves; anything else already in the harness is left alone.
 
 ## Edge cases
 
@@ -237,10 +245,13 @@ to catch malformed config before reindexing.
 - **User asks to "delete X" but X doesn't exist**: tell them so. Offer to `sc:search` for X to see if it has a different name.
 - **Source repo isn't writable** (permission denied): tell the user, suggest a different `--repo` or a `chmod`.
 - **Reindex fails** (sqlite error, missing repos.patterns): surface the exact stderr; suggest `doctor`.
-- **The skill's body references other skills**: link by full path (`/Users/me/Projects/.../skill-name`), not by slash-command — slash-commands don't work for non-bootstrap skills.
+- **`validate` fails after a create/update**: do NOT confirm success to the user. Fix the reported issues (most common: empty `description:` or non-executable `action`), re-run validate, then continue.
+- **The skill's body references other skills**: link by full path (`/Users/me/Projects/.../skill-name`), not by slash-command — slash-commands only work for harness-registered skills.
 
 ## Related
 
 - `sc:search` — search engine. Used in Step 2 of this procedure.
-- `~/.sc/search/action` — the search shell CLI (the only remaining CLI in this system).
+- `sc:list` — flat inventory; useful for "show me what's in this root" before bulk edits.
+- `~/.sc/crud/action` — the deterministic helper this procedure delegates to.
+- `~/.sc/search/action` — search/reindex/doctor CLI.
 - `/Users/coding/Projects/skill-core/INSTALL.md` — one-time bootstrap.

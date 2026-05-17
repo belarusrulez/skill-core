@@ -1,0 +1,239 @@
+#!/bin/sh
+# sc:list — enumerate every registered skill across ~/.sc/repos.patterns roots.
+#
+# Flags:
+#   --format text|tsv|json   output format (default: text)
+#   --root <abs-root>        restrict to one registered root (matched against
+#                            the expanded root path; repeatable)
+#   --match <glob|re:regex>  filter by skill DIRNAME (glob default, re: prefix
+#                            for POSIX extended regex)
+#   --names-only             emit just the frontmatter `name:` per line
+#   --count                  print total count and exit
+#   -h|--help                usage
+#
+# Exit: 0=listed >=1, 1=empty, 2=config error.
+
+set -eu
+
+SC_HOME="${SC_HOME:-$HOME/.sc}"
+SC_PATTERNS="$SC_HOME/repos.patterns"
+
+# Resolve script dir → load shared helpers, following symlinks (BSD-portable).
+sc_resolve() {
+  p="$1"
+  while [ -L "$p" ]; do
+    target=$(readlink "$p")
+    case "$target" in
+      /*) p="$target" ;;
+      *)  p="$(dirname "$p")/$target" ;;
+    esac
+  done
+  printf "%s\n" "$p"
+}
+SCRIPT_REAL=$(sc_resolve "$0")
+SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_REAL")" && pwd)
+SC_LIB="${SC_LIB:-$SCRIPT_DIR/../lib/discover.sh}"
+if [ ! -f "$SC_LIB" ]; then
+  printf 'ERROR: missing helper library: %s\n' "$SC_LIB" >&2
+  exit 2
+fi
+# shellcheck disable=SC1090
+. "$SC_LIB"
+
+usage() {
+  cat <<'EOF'
+usage: action [--format text|tsv|json] [--root <abs-root>] [--match <glob|re:regex>]
+              [--names-only] [--count]
+
+  --format    text (default) | tsv | json
+  --root      restrict to one registered root (repeatable)
+  --match     filter by skill dirname; glob default, prefix re: for regex
+  --names-only emit just the frontmatter `name:` per line
+  --count     print total count and exit
+
+exit: 0=listed >=1, 1=empty, 2=config
+EOF
+}
+
+# ----- parse flags -----
+format=text
+match=""
+names_only=0
+count_only=0
+roots_filter_file=$(mktemp -t sc_list_roots.XXXXXX)
+: > "$roots_filter_file"
+trap 'rm -f "$roots_filter_file"' EXIT INT TERM
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --format)   format="${2:?--format needs value}"; shift 2 ;;
+    --format=*) format="${1#--format=}"; shift ;;
+    --root)     printf "%s\n" "${2:?--root needs value}" >> "$roots_filter_file"; shift 2 ;;
+    --root=*)   printf "%s\n" "${1#--root=}" >> "$roots_filter_file"; shift ;;
+    --match)    match="${2:?--match needs value}"; shift 2 ;;
+    --match=*)  match="${1#--match=}"; shift ;;
+    --names-only) names_only=1; shift ;;
+    --count)    count_only=1; shift ;;
+    --) shift; break ;;
+    -*) sc_err "unknown flag: $1"; usage >&2; exit 2 ;;
+    *)  sc_err "unexpected argument: $1"; usage >&2; exit 2 ;;
+  esac
+done
+
+case "$format" in text|tsv|json) ;; *) sc_err "unknown format: $format"; exit 2 ;; esac
+
+if [ ! -f "$SC_PATTERNS" ]; then
+  sc_err "missing $SC_PATTERNS — run: sh ~/.sc/search/action doctor --write-sample"
+  exit 2
+fi
+
+# ----- match_dirname <basename>: 0 if matches --match filter (or no filter) -----
+match_dirname() {
+  b="$1"
+  [ -z "$match" ] && return 0
+  case "$match" in
+    re:*)
+      regex="${match#re:}"
+      printf "%s\n" "$b" | grep -E -q -- "$regex"
+      ;;
+    *)
+      # POSIX glob via case
+      # shellcheck disable=SC2254
+      case "$b" in
+        $match) return 0 ;;
+        *)      return 1 ;;
+      esac
+      ;;
+  esac
+}
+
+# ----- root_allowed <abs-root>: 0 if --root filter is empty or contains this root -----
+root_allowed() {
+  [ ! -s "$roots_filter_file" ] && return 0
+  grep -Fxq -- "$1" "$roots_filter_file"
+}
+
+# Materialize the discovered skill dirs once (POSIX sh has no arrays).
+dirs_file=$(mktemp -t sc_list_dirs.XXXXXX)
+# shellcheck disable=SC2064
+trap "rm -f \"$dirs_file\" \"$roots_filter_file\"" EXIT INT TERM
+sc_discover_skills > "$dirs_file" 2>/dev/null || true
+
+# Also resolve the set of registered roots (for --root validation and text grouping).
+roots_file=$(mktemp -t sc_list_allroots.XXXXXX)
+# shellcheck disable=SC2064
+trap "rm -f \"$dirs_file\" \"$roots_filter_file\" \"$roots_file\"" EXIT INT TERM
+sc_parse_patterns | awk -F'\t' '{ print $1 }' | while read -r r; do
+  sc_expand_root "$r"
+done | sort -u > "$roots_file"
+
+# Validate any --root values are actually registered.
+if [ -s "$roots_filter_file" ]; then
+  while IFS= read -r r; do
+    if ! grep -Fxq -- "$r" "$roots_file"; then
+      sc_warn "--root not in $SC_PATTERNS: $r"
+    fi
+  done < "$roots_filter_file"
+fi
+
+# Build the filtered row list as TSV: name\tdirname\tdescription\tpath\troot
+rows_file=$(mktemp -t sc_list_rows.XXXXXX)
+# shellcheck disable=SC2064
+trap "rm -f \"$dirs_file\" \"$roots_filter_file\" \"$roots_file\" \"$rows_file\"" EXIT INT TERM
+: > "$rows_file"
+
+# For each discovered skill dir, figure out which registered root it lives under.
+# Longest-prefix wins (a root nested under another root is rare but possible).
+attribute_root() {
+  d="$1"
+  best=""
+  while IFS= read -r r; do
+    case "$d/" in
+      "$r"/*)
+        if [ ${#r} -gt ${#best} ]; then best="$r"; fi
+        ;;
+    esac
+  done < "$roots_file"
+  printf "%s\n" "$best"
+}
+
+while IFS= read -r d; do
+  [ -d "$d" ] || continue
+  smd="$d/SKILL.md"
+  [ -f "$smd" ] || continue
+  dirname_v=$(basename "$d")
+  match_dirname "$dirname_v" || continue
+  root_v=$(attribute_root "$d")
+  [ -n "$root_v" ] || continue
+  root_allowed "$root_v" || continue
+  name_v=$(sc_fm_field name "$smd")
+  desc_v=$(sc_fm_field description "$smd")
+  # Replace TAB/newline in fields with spaces so TSV stays well-formed.
+  name_v=$(printf "%s" "$name_v" | tr '\t\n' '  ')
+  desc_v=$(printf "%s" "$desc_v" | tr '\t\n' '  ')
+  printf "%s\t%s\t%s\t%s\t%s\n" "$name_v" "$dirname_v" "$desc_v" "$d" "$root_v" >> "$rows_file"
+done < "$dirs_file"
+
+# Sort by root, then name.
+sort -t "$(printf '\t')" -k5,5 -k1,1 "$rows_file" -o "$rows_file"
+
+total=$(wc -l < "$rows_file" | tr -d ' ')
+
+if [ "$count_only" -eq 1 ]; then
+  printf "%s\n" "$total"
+  [ "$total" -gt 0 ] && exit 0 || exit 1
+fi
+
+if [ "$total" -eq 0 ]; then
+  case "$format" in
+    json) printf '{"results":[],"count":0}\n' ;;
+    tsv)  : ;;
+    text) printf "no skills discovered.\n" ;;
+  esac
+  exit 1
+fi
+
+if [ "$names_only" -eq 1 ]; then
+  awk -F'\t' '{ print $1 }' "$rows_file"
+  exit 0
+fi
+
+case "$format" in
+  tsv)
+    cat "$rows_file"
+    ;;
+  json)
+    printf '{"results":['
+    first=1
+    while IFS=$(printf '\t') read -r name dirname description path root; do
+      je() { printf "%s" "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+      if [ "$first" -eq 1 ]; then first=0; else printf ","; fi
+      printf '{"name":"%s","dirname":"%s","description":"%s","path":"%s","root":"%s"}' \
+        "$(je "$name")" "$(je "$dirname")" "$(je "$description")" "$(je "$path")" "$(je "$root")"
+    done < "$rows_file"
+    printf '],"count":%s}\n' "$total"
+    ;;
+  text)
+    # Group by root. Materialize the unique-root list so the outer counter is
+    # visible after the loop (no subshell pipe).
+    uniq_roots=$(mktemp -t sc_list_uroots.XXXXXX)
+    awk -F'\t' '{ print $5 }' "$rows_file" | awk '!seen[$0]++' > "$uniq_roots"
+    root_count=0
+    while IFS= read -r r; do
+      root_count=$((root_count + 1))
+      n_in_root=$(awk -F'\t' -v r="$r" '$5 == r { c++ } END { print c+0 }' "$rows_file")
+      printf "%s (%s skill%s)\n" "$r" "$n_in_root" "$( [ "$n_in_root" -eq 1 ] && echo "" || echo "s")"
+      awk -F'\t' -v r="$r" '$5 == r {
+        desc = $3
+        if (length(desc) > 70) desc = substr(desc, 1, 67) "..."
+        printf "  %-22s %s\n           → %s\n", $1, desc, $4
+      }' "$rows_file"
+      printf "\n"
+    done < "$uniq_roots"
+    rm -f "$uniq_roots"
+    printf "total: %s skill(s) across %s root(s)\n" "$total" "$root_count"
+    ;;
+esac
+
+exit 0

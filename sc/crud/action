@@ -1,0 +1,298 @@
+#!/bin/sh
+# sc:crud — deterministic helpers for the sc:crud procedure.
+#
+# The procedure (sc/crud/SKILL.md) covers the steps that need judgment
+# (decide update-vs-create, choose target repo, write description prose).
+# This script covers the steps that don't — pure filesystem operations
+# that produce the same result every time:
+#
+# Subcommands:
+#   collision-check <dirname>        exit 0=ok, 1=collision (prints colliding paths)
+#   scaffold <target-dir>            write SKILL.md template + executable action stub
+#                                    (name is derived from basename via the first-dash rule)
+#   validate <skill-dir>             check SKILL.md exists + has required frontmatter
+#                                    fields + any *.sh / action files are executable.
+#                                    exit 0=ok, 1=issues (printed on stderr).
+#   trash <source-dir>               soft-delete to ~/.sc/trash/<ts>-<dirname>/ +
+#                                    write .sc-trash-meta.json. Prints trash path.
+#   restore <trash-entry>            read meta JSON, mv back to orig_path, drop meta.
+#   import-preview <root>            walk root for SKILL.md, emit TSV:
+#                                    path<TAB>name<TAB>description<TAB>issues
+#
+# Exit: 0=ok, 1=problem (explanation on stderr), 2=usage/config error.
+
+set -eu
+
+SC_HOME="${SC_HOME:-$HOME/.sc}"
+SC_PATTERNS="$SC_HOME/repos.patterns"
+SC_TRASH="$SC_HOME/trash"
+
+# Resolve script dir → load shared helpers, following symlinks (BSD-portable).
+sc_resolve() {
+  p="$1"
+  while [ -L "$p" ]; do
+    target=$(readlink "$p")
+    case "$target" in
+      /*) p="$target" ;;
+      *)  p="$(dirname "$p")/$target" ;;
+    esac
+  done
+  printf "%s\n" "$p"
+}
+SCRIPT_REAL=$(sc_resolve "$0")
+SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_REAL")" && pwd)
+SC_LIB="${SC_LIB:-$SCRIPT_DIR/../lib/discover.sh}"
+if [ ! -f "$SC_LIB" ]; then
+  printf 'ERROR: missing helper library: %s\n' "$SC_LIB" >&2
+  exit 2
+fi
+# shellcheck disable=SC1090
+. "$SC_LIB"
+
+usage() {
+  cat <<'EOF'
+usage: action <subcommand> [args]
+
+  collision-check <dirname>     exit 0=ok, 1=collision (prints colliding paths)
+  scaffold <target-dir>         write SKILL.md + executable action stub
+  validate <skill-dir>          check structure; exit 0=ok, 1=issues
+  trash <source-dir>            soft-delete to ~/.sc/trash/; prints trash path
+  restore <trash-entry>         move back to orig_path from meta JSON
+  import-preview <root>         emit TSV: path<TAB>name<TAB>description<TAB>issues
+
+exit: 0=ok, 1=problem, 2=usage/config
+EOF
+}
+
+# ----- collision-check: any existing skill directory has this basename? -----
+# Pipe-to-while subshells under `set -e` propagate the last iteration's exit
+# status. Trailing `:` keeps the loop body's last command at exit 0 so the
+# pipeline never accidentally kills the script when no match is found.
+cmd_collision_check() {
+  dirname="${1:?dirname required}"
+  hits_file=$(mktemp -t sc_crud_hits.XXXXXX)
+  : > "$hits_file"
+  sc_discover_skills 2>/dev/null | while IFS= read -r d; do
+    [ "$(basename "$d")" = "$dirname" ] && printf "%s\n" "$d"
+    :
+  done > "$hits_file"
+  if [ -s "$hits_file" ]; then
+    sc_warn "collision: skill basename '$dirname' already exists at:"
+    cat "$hits_file" >&2
+    rm -f "$hits_file"
+    return 1
+  fi
+  rm -f "$hits_file"
+  return 0
+}
+
+# ----- scaffold: write SKILL.md + action stub at target-dir -----
+cmd_scaffold() {
+  target="${1:?target-dir required}"
+  if [ -e "$target" ]; then
+    sc_err "target exists: $target"
+    return 1
+  fi
+  dirname=$(basename "$target")
+  name=$(sc_name_from_dirname "$dirname")
+
+  mkdir -p "$target"
+  cat > "$target/SKILL.md" <<EOF
+---
+name: $name
+description: TODO — one trigger-style sentence: what the skill does + WHEN to use it. Front-load synonyms users will type.
+user_invocable: true
+---
+
+# $name
+
+TODO — describe the procedure. Include concrete CLI examples, when-to-use and when-NOT-to-use guidance, and links to related skills.
+EOF
+
+  cat > "$target/action" <<'EOF'
+#!/bin/sh
+# TODO implement the skill's helper, or delete this file if the procedure is pure-AI.
+set -eu
+echo "$(basename "$0"): TODO implement" >&2
+exit 2
+EOF
+  chmod +x "$target/action"
+
+  printf "scaffolded: %s\n" "$target"
+  printf "  SKILL.md   (name=%s)\n" "$name"
+  printf "  action     (executable stub)\n"
+  printf "next: edit SKILL.md (front-load triggers in description), implement or delete action,\n"
+  printf "      then run: sh ~/.sc/crud/action validate %s\n" "$target"
+}
+
+# ----- validate: structural sanity check -----
+cmd_validate() {
+  d="${1:?skill-dir required}"
+  if [ ! -d "$d" ]; then
+    sc_err "not a directory: $d"
+    return 1
+  fi
+  smd="$d/SKILL.md"
+  issues_file=$(mktemp -t sc_crud_val.XXXXXX)
+  : > "$issues_file"
+
+  if [ ! -f "$smd" ]; then
+    printf "missing SKILL.md\n" >> "$issues_file"
+  else
+    # Check frontmatter present (sc_has_frontmatter returns 0=yes, 1=no).
+    if ! sc_has_frontmatter "$smd"; then
+      printf "SKILL.md has no frontmatter block\n" >> "$issues_file"
+    else
+      name_v=$(sc_fm_field name "$smd")
+      desc_v=$(sc_fm_field description "$smd")
+      [ -z "$name_v" ] && printf "frontmatter: name is empty\n" >> "$issues_file"
+      [ -z "$desc_v" ] && printf "frontmatter: description is empty\n" >> "$issues_file"
+      # No dirname-vs-name check: layouts vary (e.g. skill-core nests sc:list at
+      # sc/list/ rather than sc/sc-list/). Authors pick their own namespacing.
+    fi
+  fi
+
+  # Any *.sh or `action` file in dir should be executable.
+  for f in "$d"/action "$d"/*.sh; do
+    [ -f "$f" ] || continue
+    [ -x "$f" ] || printf "script not executable: %s (chmod +x)\n" "$f" >> "$issues_file"
+  done
+
+  if [ -s "$issues_file" ]; then
+    sc_err "validation failed for $d:"
+    sed 's/^/  - /' "$issues_file" >&2
+    rm -f "$issues_file"
+    return 1
+  fi
+  rm -f "$issues_file"
+  printf "OK: %s\n" "$d"
+  return 0
+}
+
+# ----- trash: soft-delete to ~/.sc/trash/<ts>-<dirname>/ -----
+cmd_trash() {
+  src="${1:?source-dir required}"
+  if [ ! -d "$src" ]; then
+    sc_err "not a directory: $src"
+    return 1
+  fi
+  src_abs=$(cd "$src" && pwd)
+  dirname=$(basename "$src_abs")
+  ts=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+  iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  target="$SC_TRASH/${ts}-${dirname}"
+
+  mkdir -p "$SC_TRASH"
+  if [ -e "$target" ]; then
+    sc_err "trash target exists (timestamp collision?): $target"
+    return 1
+  fi
+  mv "$src_abs" "$target"
+
+  # Hand-rolled JSON (no jq dependency). orig_path comes from a controlled abs
+  # path; still escape backslashes + double-quotes for safety.
+  esc_path=$(printf "%s" "$src_abs" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  esc_name=$(printf "%s" "$dirname" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  cat > "$target/.sc-trash-meta.json" <<EOF
+{"name":"$esc_name","orig_path":"$esc_path","deleted_at":"$iso"}
+EOF
+
+  printf "%s\n" "$target"
+}
+
+# ----- restore: move trash entry back to orig_path -----
+cmd_restore() {
+  entry="${1:?trash-entry required}"
+  if [ ! -d "$entry" ]; then
+    sc_err "not a directory: $entry"
+    return 1
+  fi
+  meta="$entry/.sc-trash-meta.json"
+  if [ ! -f "$meta" ]; then
+    sc_err "missing meta: $meta"
+    return 1
+  fi
+  # Extract orig_path with awk (POSIX, no jq). Matches "orig_path":"<value>"
+  # and unescapes \" and \\.
+  orig=$(awk '
+    {
+      n = index($0, "\"orig_path\"")
+      if (n == 0) next
+      rest = substr($0, n + length("\"orig_path\""))
+      m = index(rest, ":")
+      if (m == 0) next
+      rest = substr(rest, m + 1)
+      sub(/^[[:space:]]*"/, "", rest)
+      out = ""
+      i = 1
+      while (i <= length(rest)) {
+        c = substr(rest, i, 1)
+        if (c == "\\" && i < length(rest)) {
+          n2 = substr(rest, i + 1, 1)
+          if (n2 == "\"" || n2 == "\\") { out = out n2; i += 2; continue }
+        }
+        if (c == "\"") break
+        out = out c
+        i += 1
+      }
+      print out
+      exit
+    }
+  ' "$meta")
+
+  if [ -z "$orig" ]; then
+    sc_err "could not parse orig_path from $meta"
+    return 1
+  fi
+  if [ -e "$orig" ]; then
+    sc_err "restore target exists: $orig"
+    return 1
+  fi
+  mkdir -p "$(dirname "$orig")"
+  mv "$entry" "$orig"
+  rm -f "$orig/.sc-trash-meta.json"
+  printf "restored: %s\n" "$orig"
+}
+
+# ----- import-preview: walk root, emit TSV row per discovered SKILL.md -----
+cmd_import_preview() {
+  root="${1:?root required}"
+  if [ ! -d "$root" ]; then
+    sc_err "not a directory: $root"
+    return 1
+  fi
+  found=0
+  find "$root" -type f -name SKILL.md 2>/dev/null | sort | while IFS= read -r smd; do
+    d=$(dirname "$smd")
+    name_v=$(sc_fm_field name "$smd")
+    desc_v=$(sc_fm_field description "$smd")
+    issues=""
+    [ -z "$name_v" ]  && issues="${issues}${issues:+;}missing-name"
+    [ -z "$desc_v" ] && issues="${issues}${issues:+;}missing-description"
+    sc_has_frontmatter "$smd" || issues="${issues}${issues:+;}no-frontmatter"
+    name_v=$(printf "%s" "$name_v" | tr '\t\n' '  ')
+    desc_v=$(printf "%s" "$desc_v" | tr '\t\n' '  ')
+    printf "%s\t%s\t%s\t%s\n" "$d" "$name_v" "$desc_v" "$issues"
+  done
+}
+
+# ----- dispatch -----
+main() {
+  if [ "$#" -eq 0 ]; then
+    usage
+    return 2
+  fi
+  sub="$1"; shift
+  case "$sub" in
+    collision-check) cmd_collision_check "$@" ;;
+    scaffold)        cmd_scaffold "$@" ;;
+    validate)        cmd_validate "$@" ;;
+    trash)           cmd_trash "$@" ;;
+    restore)         cmd_restore "$@" ;;
+    import-preview)  cmd_import_preview "$@" ;;
+    -h|--help|help)  usage; return 0 ;;
+    *) sc_err "unknown subcommand: $sub"; usage >&2; return 2 ;;
+  esac
+}
+
+main "$@"
