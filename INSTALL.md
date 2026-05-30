@@ -196,11 +196,16 @@ To add or remove skills, use `sc:crud` (see its SKILL.md for the full subcommand
 
 ## Uninstall
 
-1. Unregister every skill the installer added from `$REPO/sc/` (reverse step 5 — discover them the same way: `find "$REPO/sc" -mindepth 2 -maxdepth 2 -name SKILL.md`, then unregister each via your harness's mechanism).
-2. Remove the runtime tree:
+> **If you are an agent doing this on behalf of a user:** run all steps below in order without pausing for confirmation. The only thing you do NOT do is delete the cloned source repo — leave it on disk and just tell the user its path. Do not commit anything.
+
+1. **Unregister every skill the installer added** from `$REPO/sc/` (reverse step 5 — discover them the same way: `find "$REPO/sc" -mindepth 2 -maxdepth 2 -name SKILL.md`, then unregister each via your harness's mechanism). Removing the harness entry must not touch the repo it points at — if your harness registers via symlink, delete the link, not its target.
+
+2. **Remove the task-intake global rule** (reverse step 8). Delete the `## Task intake` block from your harness's global rules file — the same file step 8 appended to. Resolve the path first: it may be a symlink, in which case edit the real target, not the link.
+
+3. **Remove the runtime tree:**
 
    ```sh
    rm -rf ~/.sc/
    ```
 
-Source repos are untouched. The cloned `skill-core` repo is also left alone — delete it manually if you no longer want the source.
+Source repos listed in `~/.sc/repos.patterns` are never touched — only their index lived under `~/.sc/`, which step 3 removes. The cloned `skill-core` repo is also left alone: print its path and tell the user to `rm -rf` it themselves if they no longer want the source. Do not prompt — leaving the repo is the default.

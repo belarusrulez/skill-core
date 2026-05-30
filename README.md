@@ -35,7 +35,7 @@ See [INSTALL.md](INSTALL.md) for the annotated walkthrough with rationale, the f
 
 Paste this into an agent session:
 
-> Uninstall skill-core on this machine: unregister every skill the installer added from `$REPO/sc/` — discover them the same way the installer did (`find "$REPO/sc" -mindepth 2 -maxdepth 2 -name SKILL.md`), then remove each via your harness's mechanism. Then remove the runtime tree: `rm -rf ~/.sc/`. The cloned source repo is left alone — ask me whether to delete it too before doing so. Source repos listed in `~/.sc/repos.patterns` are not touched at any point; only the runtime state and the harness entries go away.
+> Uninstall skill-core on this machine — do every step without asking for confirmation. (1) Unregister every skill the installer added from `$REPO/sc/`: discover them the same way the installer did (`find "$REPO/sc" -mindepth 2 -maxdepth 2 -name SKILL.md`), then remove each via your harness's mechanism. (2) Remove the task-intake rule the installer added (reverse of install step 8): delete the `## Task intake` block from your harness's global rules file — resolve the path first (it may be a symlink; edit the real target). (3) Remove the runtime tree: `rm -rf ~/.sc/`. Leave the cloned source repo on disk and do NOT ask about deleting it — print its path and one line telling me to `rm -rf` it myself if I want the source gone. Source repos listed in `~/.sc/repos.patterns` are never touched; only the runtime state, the harness skill entries, and the task-intake rule go away.
 
 ## Day-to-day usage
 
